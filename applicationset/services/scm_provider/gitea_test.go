@@ -1,10 +1,12 @@
 package scm_provider
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,13 +20,13 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch r.RequestURI {
-		case "/api/v1/version":
+		switch {
+		case r.RequestURI == "/api/v1/version":
 			_, err := io.WriteString(w, `{"version":"1.17.0+dev-452-g1f0541780"}`)
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/orgs/test-argocd/repos?limit=0&page=1":
+		case strings.HasPrefix(r.RequestURI, "/api/v1/orgs/test-argocd/repos?"):
 			_, err := io.WriteString(w, `[{
 					"id": 21618,
 					"owner": {
@@ -184,7 +186,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/test-argocd/another-repo/branches/main":
+		case r.RequestURI == "/api/v1/repos/test-argocd/another-repo/branches/main":
 			_, err := io.WriteString(w, `{
 				"name": "main",
 				"commit": {
@@ -224,7 +226,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/test-argocd/pr-test/branches/test":
+		case r.RequestURI == "/api/v1/repos/test-argocd/pr-test/branches/test":
 			_, err := io.WriteString(w, `{
 				"name": "test",
 				"commit": {
@@ -264,7 +266,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/test-argocd/another-repo/branches/test":
+		case r.RequestURI == "/api/v1/repos/test-argocd/another-repo/branches/test":
 			_, err := io.WriteString(w, `{
 				"name": "test",
 				"commit": {
@@ -304,7 +306,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/test-argocd/pr-test/branches/main":
+		case r.RequestURI == "/api/v1/repos/test-argocd/pr-test/branches/main":
 			_, err := io.WriteString(w, `{
 				"name": "main",
 				"commit": {
@@ -344,7 +346,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/test-argocd/another-repo/branches?limit=0&page=1":
+		case strings.HasPrefix(r.RequestURI, "/api/v1/repos/test-argocd/another-repo/branches?"):
 			_, err := io.WriteString(w, `[{
 				"name": "main",
 				"commit": {
@@ -420,7 +422,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/test-argocd/pr-test/branches?limit=0&page=1":
+		case strings.HasPrefix(r.RequestURI, "/api/v1/repos/test-argocd/pr-test/branches?"):
 			_, err := io.WriteString(w, `[{
 				"name": "main",
 				"commit": {
@@ -495,7 +497,7 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 			if err != nil {
 				t.Fail()
 			}
-		case "/api/v1/repos/gitea/go-sdk/contents/README.md?ref=master":
+		case r.RequestURI == "/api/v1/repos/gitea/go-sdk/contents/README.md?ref=master":
 			_, err := io.WriteString(w, `{
   "name": "README.md",
   "path": "README.md",
@@ -519,10 +521,10 @@ func giteaMockHandler(t *testing.T) func(http.ResponseWriter, *http.Request) {
 }
 `)
 			require.NoError(t, err)
-		case "/api/v1/repos/gitea/go-sdk/contents/gitea?ref=master":
+		case r.RequestURI == "/api/v1/repos/gitea/go-sdk/contents/gitea?ref=master":
 			_, err := io.WriteString(w, testdata.ReposGiteaGoSdkContentsGiteaResponse)
 			require.NoError(t, err)
-		case "/api/v1/repos/gitea/go-sdk/contents/notathing?ref=master":
+		case r.RequestURI == "/api/v1/repos/gitea/go-sdk/contents/notathing?ref=master":
 			w.WriteHeader(http.StatusNotFound)
 			_, err := io.WriteString(w, `{"errors":["object does not exist [id: , rel_path: notathing]"],"message":"GetContentsOrList","url":"https://gitea.com/api/swagger"}`)
 			require.NoError(t, err)
@@ -916,4 +918,82 @@ func TestNewGiteaProvider_Proxy(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Positive(t, proxyCalled, "Proxy should have been called")
+}
+
+// TestGiteaPaginationMultiPage verifies the provider pages through list
+// endpoints instead of silently dropping everything past the server's default
+// page size: the mock serves page-size-3 pages while holding 5 items, so a
+// single-call implementation would return only 3.
+func TestGiteaPaginationMultiPage(t *testing.T) {
+	t.Parallel()
+	const total = 5
+	const pageSize = 3
+	jsonPage := func(prefix string) func(page int) string {
+		return func(page int) string {
+			start := (page - 1) * pageSize
+			end := start + pageSize
+			if end > total {
+				end = total
+			}
+			out := "["
+			for i := start; i < end; i++ {
+				if i > start {
+					out += ","
+				}
+				out += fmt.Sprintf(`{"name":"%s-%d","full_name":"test-argocd/%s-%d","id":%d,"archived":false,"default_branch":"main","commit":{"id":"sha-%d"},"owner":{"login":"test-argocd"}}`, prefix, i, prefix, i, i, i)
+			}
+			out += "]"
+			return out
+		}
+	}
+	repoPage := jsonPage("repo")
+	branchPage := jsonPage("branch")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &page)
+		}
+		switch {
+		case r.URL.Path == "/api/v1/version":
+			_, _ = io.WriteString(w, `{"version":"1.22.0"}`)
+		case r.URL.Path == "/api/v1/orgs/test-argocd/repos":
+			_, _ = io.WriteString(w, repoPage(page))
+		case r.URL.Path == "/api/v1/repos/test-argocd/myrepo/branches":
+			_, _ = io.WriteString(w, branchPage(page))
+		default:
+			_, _ = io.WriteString(w, `[]`)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Run("GetBranches returns all pages", func(t *testing.T) {
+		t.Parallel()
+		provider, err := NewGiteaProvider("test-argocd", "", ts.URL, true, false, false, "", "")
+		require.NoError(t, err)
+		repos, err := provider.GetBranches(t.Context(), &Repository{
+			Organization: "test-argocd",
+			Repository:   "myrepo",
+			URL:          "https://x/myrepo.git",
+		})
+		require.NoError(t, err)
+		require.Len(t, repos, total)
+		for i, repo := range repos {
+			require.Equal(t, fmt.Sprintf("branch-%d", i), repo.Branch)
+		}
+	})
+
+	t.Run("ListRepos returns all pages", func(t *testing.T) {
+		t.Parallel()
+		provider, err := NewGiteaProvider("test-argocd", "", ts.URL, false, false, false, "", "")
+		require.NoError(t, err)
+		repos, err := provider.ListRepos(t.Context(), "https")
+		require.NoError(t, err)
+		require.Len(t, repos, total)
+		for i, repo := range repos {
+			require.Equal(t, fmt.Sprintf("repo-%d", i), repo.Repository)
+		}
+	})
 }
